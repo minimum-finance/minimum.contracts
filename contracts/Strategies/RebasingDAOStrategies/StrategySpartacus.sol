@@ -25,10 +25,10 @@ import "@openzeppelin/contracts/math/Math.sol";
 */
 
 /**
- * @dev Rebasing DAO yield optimizer for spartacus.finance
+ * @dev Rebasing DAO yield optimizer for FantOHM DAO
  * @author minimum.finance
  */
-contract StrategySpartacus is StratManager, FeeManager {
+contract StrategyFantOHM is StratManager, FeeManager {
     using SafeMath for uint256;
     using SafeERC20 for IERC20;
 
@@ -43,9 +43,9 @@ contract StrategySpartacus is StratManager, FeeManager {
      * {stakedRebaseToken}  - The staked version of {rebaseToken}
      */
     address public constant rebaseToken =
-        0x5602df4A94eB6C680190ACCFA2A475621E0ddBdc; // SPA
+        0xfa1FBb8Ef55A4855E5688C0eE13aC3f202486286; // FHM
     address public constant stakedRebaseToken =
-        0x8e2549225E21B1Da105563D419d5689b80343E01; // sSPA
+        0x5E983ff70DE345de15DbDCf0529640F14446cDfa; // sFHM
 
     /**
      * @dev Bonds:
@@ -56,7 +56,6 @@ contract StrategySpartacus is StratManager, FeeManager {
     address[] public bonds;
     mapping(address => uint256) indexOfBond; // 1-based to avoid default value
     address public currentBond;
-    uint256 public rebaseBonded;
 
     /**
      * @dev RebasingDAO Contracts:
@@ -66,27 +65,32 @@ contract StrategySpartacus is StratManager, FeeManager {
     address public rebaseStaker;
     address public stakeManager;
 
-    struct Claim {
+    struct ReservePeriod {
         bool fullyVested;
+        uint256 warmupExpiry;
+    }
+
+    struct Claim {
         uint256 amount;
         uint256 index;
+        uint256 reservePeriod;
     }
 
     /**
      * @dev Withdrawal:
      * {claimOfReserves}     - how much a user owns of the reserves in {rebaseToken}
-     * {reserveUsers}        - list of users who requested a withdraw
      * {reserves}            - {rebaseToken} reserved for withdrawal use so that it cannot be bonded
-     * {claimers}            - list of users who can calim -- for forcePayoutChunk
+     * {claimers}            - list of users who can claim -- for forcePayoutChunk
      */
     mapping(address => Claim) public claimOfReserves;
-    address[] public reserveUsers;
+    mapping(uint256 => ReservePeriod) public reservePeriods;
+    uint256 public currentReservePeriod;
     uint256 public reserves;
     address[] public claimers;
 
     // Utilities
     IUniswapV2Pair public constant rebaseTokenDaiPair =
-        IUniswapV2Pair(0xFa5a5F0bC990Be1D095C5385Fff6516F6e03c0a7); // Used to get price of rebaseToken in USD
+        IUniswapV2Pair(0xd77fc9c4074b56Ecf80009744391942FBFDDd88b); // Used to get price of rebaseToken in USD
 
     /**
      * @dev Events:
@@ -104,22 +108,36 @@ contract StrategySpartacus is StratManager, FeeManager {
      */
     event Deposit(uint256 trl);
     event Reserve(uint256 trl, uint256 payout);
-    event Stake(uint256 totalStaked, uint256 totalBonded);
+    event Stake(uint256 totalStaked, uint256 totalWarmup, uint256 totalBonded);
     event Unstake(
-        uint256 totalStaked,
         uint256 totalUnstaked,
+        uint256 totalStaked,
+        uint256 totalWarmup,
         uint256 totalBonded
     );
     event Bond(
-        uint256 totalStaked,
         uint256 totalUnstaked,
+        uint256 totalStaked,
+        uint256 totalWarmup,
         uint256 totalBonded,
         address bondDepository
     );
     event BondAdded(address[] bonds);
     event BondRemoved(address[] bonds);
-    event Redeem(uint256 trl, uint256 rebaseRedeemed);
-    event RedeemFinal(uint256 trl, uint256 rebaseRedeemed);
+    event Redeem(
+        uint256 totalUnstaked,
+        uint256 totalStaked,
+        uint256 totalWarmup,
+        uint256 totalBonded,
+        uint256 trl
+    );
+    event RedeemFinal(
+        uint256 totalUnstaked,
+        uint256 totalStaked,
+        uint256 totalWarmup,
+        uint256 trl
+    );
+    event ChargeFees(uint256 feeAmount);
 
     constructor(
         address _vault,
@@ -156,6 +174,13 @@ contract StrategySpartacus is StratManager, FeeManager {
      * @dev Interface method for interoperability with vault
      */
     function want() external pure returns (address) {
+        return stakedRebaseToken;
+    }
+
+    /**
+     * @dev Interface method for interoperability with vault
+     */
+    function output() external pure returns (address) {
         return rebaseToken;
     }
 
@@ -181,22 +206,40 @@ contract StrategySpartacus is StratManager, FeeManager {
     }
 
     /**
+     * @dev Total balance warming up from staking.
+     */
+    function warmupBalance() public view returns (uint256 _warmupBal) {
+        (_warmupBal, , , ) = IStakingManager(stakeManager).warmupInfo(
+            address(this)
+        );
+    }
+
+    /**
      * @dev Total available staked and unstaked {rebaseToken} locked
      */
     function availableRebaseToken() public view returns (uint256) {
-        return totalRebasing().sub(reserves);
+        return reserves < totalRebasing() ? totalRebasing().sub(reserves) : 0;
+    }
+
+    /**
+     * @dev Get the current amount of rebase bonded, pending payout
+     */
+    function rebaseBonded() public view returns (uint256 _rebaseBonded) {
+        if (isBonding())
+            (_rebaseBonded, , , ) = IBondDepository(currentBond).bondInfo(
+                address(this)
+            );
     }
 
     /**
      * @dev Total staked, unstaked, and bonded {rebaseToken} locked
      */
     function totalBalance() public view returns (uint256) {
-        uint256 rebaseAmount = totalRebasing();
+        uint256 rebaseAmount = totalRebasing().add(rebaseBonded()).add(
+            warmupBalance()
+        );
 
-        return
-            reserves < rebaseAmount.add(rebaseBonded)
-                ? rebaseAmount.add(rebaseBonded).sub(reserves)
-                : 0;
+        return reserves < rebaseAmount ? rebaseAmount.sub(reserves) : 0;
     }
 
     /**
@@ -224,11 +267,11 @@ contract StrategySpartacus is StratManager, FeeManager {
     /* ======== USER FUNCTIONS ======== */
 
     /**
-     * @dev Deposit available {rebaseToken} into Spartacus
+     * @dev Deposit available {rebaseToken} into FantOHM
      * @notice Emits Deposit(trl)
      */
     function deposit() external whenNotPaused {
-        _stake();
+        _claimStake(false);
 
         emit Deposit(totalBalance());
     }
@@ -247,22 +290,24 @@ contract StrategySpartacus is StratManager, FeeManager {
             _amount.mul(withdrawalFee).div(WITHDRAWAL_FEE_DIVISOR)
         );
 
-        if (isBonding()) {
+        _claimStake(false);
+
+        if (isBonding() || !warmedUp()) {
+            // If we're currently bonding/warming up, user will vest for the bond period + warmup
             Claim memory previousClaim = claimOfReserves[_claimer];
-            if (previousClaim.fullyVested || previousClaim.amount == 0)
-                reserveUsers.push(_claimer);
             if (previousClaim.index == 0) claimers.push(_claimer);
 
             claimOfReserves[_claimer] = Claim({
                 amount: previousClaim.amount.add(_amount),
-                fullyVested: false, // Notice that users should claim before reserving again
                 index: previousClaim.index == 0
                     ? claimers.length
-                    : previousClaim.index
+                    : previousClaim.index,
+                reservePeriod: currentReservePeriod // Notice that users should claim before reserving again
             });
 
             reserves = reserves.add(_amount);
         } else {
+            // If we're not bonding and warmed up pay right away
             if (_amount > totalRebasing()) _amount = totalRebasing();
 
             _pay(_claimer, _amount);
@@ -274,10 +319,11 @@ contract StrategySpartacus is StratManager, FeeManager {
     /**
      * @dev Claim vested out position
      * @param _claimer The address of the claimer
+     * @return The amount of {rebaseToken} claimed
      */
     function claim(address _claimer) external returns (uint256) {
         require(msg.sender == vault, "!Vault");
-        require(claimOfReserves[_claimer].fullyVested, "!fullyVested");
+        require(claimerVested(_claimer), "!fullyVested");
         return _claim(_claimer);
     }
 
@@ -314,7 +360,7 @@ contract StrategySpartacus is StratManager, FeeManager {
     }
 
     /**
-     * @dev Move all sSPA from staking to bonding funds in a single token bond
+     * @dev Move all sFHM from staking to bonding funds in a single token bond
      * @param bondDepository address of BondDepository to use
      * @param rebaseToPrincipleRoute the route from {rebaseToken} to bond principle
      */
@@ -330,7 +376,7 @@ contract StrategySpartacus is StratManager, FeeManager {
     }
 
     /**
-     * @dev Move all sSPA from staking to bonding funds in an LP token bond
+     * @dev Move all sFHM from staking to bonding funds in an LP token bond
      * @param bondDepository address of BondDepository to use
      * @param rebaseToToken0Route route from {rebaseToken} to token0 in the LP
      * @param rebaseToToken1Route route from {rebaseToken} to token1 in the LP
@@ -350,7 +396,7 @@ contract StrategySpartacus is StratManager, FeeManager {
 
     /**
      * @dev Move from staking to bonding funds in a single token bond
-     * @param _amount of sSPA to withdraw and bond
+     * @param _amount of sFHM to withdraw and bond
      * @param bondDepository BondDepository of the bond to use
      * @param rebaseToPrincipleRoute The route to take from {rebaseToken} to the bond principle token
      */
@@ -362,6 +408,11 @@ contract StrategySpartacus is StratManager, FeeManager {
         require(!isBonding(), "Already bonding!");
         require(_amount > 0, "amount <= 0!");
         require(isBondValid(address(bondDepository)), "Unapproved bond!");
+        require(warmedUp(), "!warmedUp");
+        require(
+            reservePeriodFinished(currentReservePeriod),
+            "!reservePeriodFinished"
+        );
         require(
             rebaseToPrincipleRoute.length > 0 &&
                 rebaseToPrincipleRoute[0] == rebaseToken,
@@ -373,23 +424,28 @@ contract StrategySpartacus is StratManager, FeeManager {
             "Route must end with bond principle!"
         );
         require(bondIsPositive(bondDepository), "!bondIsPositive");
+
+        _beginNewReservePeriod(false, 0);
         currentBond = address(bondDepository);
 
-        uint256 maxBondableSPA = maxBondSize(bondDepository);
+        uint256 maxBondableRebase = maxBondSize(bondDepository);
+
+        _claimStake(false);
 
         if (_amount > availableRebaseToken()) _amount = availableRebaseToken();
-        if (_amount > maxBondableSPA) _amount = maxBondableSPA;
+        if (_amount > maxBondableRebase) _amount = maxBondableRebase;
 
-        rebaseBonded = _amount;
         uint256 unstaked = unstakedRebasing();
-        if (_amount > unstaked) _unstake(_amount.sub(unstaked)); // gets SPA to this strategy
+        if (_amount > unstaked) _unstake(_amount.sub(unstaked)); // gets FHM to this strategy
+
+        _amount = _chargeFees(_amount);
 
         _bondSingleToken(_amount, bondDepository, rebaseToPrincipleRoute);
     }
 
     /**
      * @dev Move from staking to bonding funds in an LP token bond
-     * @param _amount of sSPA to withdraw and bond
+     * @param _amount of sFHM to withdraw and bond
      * @param bondDepository BondDepository of the bond to use
      * @param rebaseToToken0Route route from {rebaseToken} to token0 in the LP
      * @param rebaseToToken1Route route from {rebaseToken} to token1 in the LP
@@ -403,6 +459,11 @@ contract StrategySpartacus is StratManager, FeeManager {
         require(!isBonding(), "Already bonding!");
         require(_amount > 0, "amount <= 0!");
         require(isBondValid(address(bondDepository)), "Unapproved bond!");
+        require(warmedUp(), "!warmedUp");
+        require(
+            reservePeriodFinished(currentReservePeriod),
+            "!reservePeriodFinished"
+        );
         require(
             rebaseToToken0Route.length > 0 &&
                 rebaseToToken1Route.length > 0 &&
@@ -418,15 +479,21 @@ contract StrategySpartacus is StratManager, FeeManager {
             "Routes must end with their respective tokens!"
         );
         require(bondIsPositive(bondDepository), "!bondIsPositive");
+
+        _beginNewReservePeriod(false, 0);
         currentBond = address(bondDepository);
 
-        uint256 maxBondableSPA = maxBondSize(bondDepository);
+        uint256 maxBondableRebase = maxBondSize(bondDepository);
+
+        _claimStake(false);
 
         if (_amount > availableRebaseToken()) _amount = availableRebaseToken();
-        if (_amount > maxBondableSPA) _amount = maxBondableSPA;
+        if (_amount > maxBondableRebase) _amount = maxBondableRebase;
 
         uint256 unstaked = unstakedRebasing();
-        if (_amount > unstaked) _unstake(_amount.sub(unstaked)); // gets SPA to this strategy
+        if (_amount > unstaked) _unstake(_amount.sub(unstaked)); // gets FHM to this strategy
+
+        _amount = _chargeFees(_amount);
 
         _bondLPToken(
             _amount,
@@ -440,19 +507,21 @@ contract StrategySpartacus is StratManager, FeeManager {
      * @dev Redeem and stake rewards from a bond
      */
     function redeemAndStake() external onlyManager {
-        _redeem();
+        require(isBonding(), "!Bonding");
+        _redeem(false);
     }
 
     /**
      * @dev Force push payout to claimer
      * @param _claimer The address of the claimer to payout
+     * @return amount of {rebaseToken} claimed.
      */
     function forcePayout(address _claimer)
         external
         onlyOwner
         returns (uint256)
     {
-        require(claimOfReserves[_claimer].fullyVested, "!fullyVested");
+        require(claimerVested(_claimer), "!fullyVested");
         return _claim(_claimer);
     }
 
@@ -463,6 +532,12 @@ contract StrategySpartacus is StratManager, FeeManager {
      */
     function forcePayoutChunk() external onlyOwner returns (bool) {
         require(!isBonding(), "Cannot force payout chunk during bond!");
+        require(warmedUp(), "Must be warmed up!");
+        require(
+            reservePeriodFinished(currentReservePeriod),
+            "!reservePeriodFinished"
+        );
+        _claimStake(false);
         uint256 chunkSize = Math.min(50, claimers.length);
         uint256 totalRebaseToken = totalRebasing();
         uint256 tempReserves = reserves;
@@ -502,8 +577,9 @@ contract StrategySpartacus is StratManager, FeeManager {
      */
     function _claim(address _claimer) internal returns (uint256) {
         Claim memory userClaim = claimOfReserves[_claimer];
-
         delete claimOfReserves[_claimer];
+
+        _claimStake(false);
 
         // If for some reason we can't fulfill reserves, pay as much as we can to everyone
         uint256 _amount = reserves > totalRebasing()
@@ -534,16 +610,33 @@ contract StrategySpartacus is StratManager, FeeManager {
     }
 
     /**
-     * @dev Stake all of the strategy's {rebaseToken}
+     * @dev Claim from warmup and then stake all of the strategy's
+     * {rebaseToken}, only if it won't extend the warmup period.
+     * @param extend Whether or not to stake if it will extend the warmup
      */
-    function _stake() internal {
+    function _stake(bool extend) internal {
         uint256 _amount = unstakedRebasing();
         if (_amount < minDeposit) return;
 
-        IERC20(rebaseToken).safeIncreaseAllowance(rebaseStaker, _amount);
-        IRebaseStaker(rebaseStaker).stake(_amount);
+        _claimStake(false);
+        if (extend || safeToStake()) {
+            IERC20(rebaseToken).safeIncreaseAllowance(rebaseStaker, _amount);
+            _setStakeLock(false);
+            IRebaseStaker(rebaseStaker).stake(_amount);
+            _setStakeLock(true);
+        }
 
-        emit Stake(stakedRebasing(), rebaseBonded);
+        emit Stake(stakedRebasing(), warmupBalance(), rebaseBonded());
+    }
+
+    /**
+     * @dev Claim rewards from staking warmup
+     * @param forfeit Whether or not to forfeit if not warmed up
+     */
+    function _claimStake(bool forfeit) internal {
+        if (IStakingManager(stakeManager).warmupPeriod() == 0) return;
+        if (warmedUp()) IStakingManager(stakeManager).claim(address(this));
+        else if (forfeit) IStakingManager(stakeManager).forfeit();
     }
 
     /**
@@ -559,7 +652,12 @@ contract StrategySpartacus is StratManager, FeeManager {
         IERC20(stakedRebaseToken).safeIncreaseAllowance(stakeManager, _amount);
         IStakingManager(stakeManager).unstake(_amount, true);
 
-        emit Unstake(stakedRebasing(), unstakedRebasing(), rebaseBonded);
+        emit Unstake(
+            unstakedRebasing(),
+            stakedRebasing(),
+            warmupBalance(),
+            rebaseBonded()
+        );
     }
 
     /**
@@ -646,7 +744,7 @@ contract StrategySpartacus is StratManager, FeeManager {
 
     /**
      * @dev Deposit into single sided bond
-     * @param _amount of SPA to swap to single token and bond
+     * @param _amount of FHM to swap to single token and bond
      * @param bondDepository BondDepository address
      * @param rebaseToPrincipleRoute The route to swap from {rebaseToken} to the bond principle token
      */
@@ -676,7 +774,7 @@ contract StrategySpartacus is StratManager, FeeManager {
 
     /**
      * @dev Deposit into LP bond
-     * @param _amount of SPA to swap to LP token and bond
+     * @param _amount of FHM to swap to LP token and bond
      * @param bondDepository BondDepository address
      * @param rebaseToToken0Route route from {rebaseToken} to token0 in the LP
      * @param rebaseToToken1Route route from {rebaseToken} to token1 in the LP
@@ -695,8 +793,6 @@ contract StrategySpartacus is StratManager, FeeManager {
             address(this)
         );
 
-        uint256 unstakedBefore = unstakedRebasing();
-
         _provideLiquidity(
             _amount,
             token0,
@@ -704,8 +800,6 @@ contract StrategySpartacus is StratManager, FeeManager {
             rebaseToToken0Route,
             rebaseToToken1Route
         );
-
-        rebaseBonded = unstakedBefore.sub(unstakedRebasing());
 
         uint256 bondTokenObtained = IERC20(bondToken)
             .balanceOf(address(this))
@@ -738,12 +832,13 @@ contract StrategySpartacus is StratManager, FeeManager {
 
         // Bond principle tokens
         bondDepository.deposit(_amount, maxPremium, address(this));
-        _stake();
+        _stake(false);
 
         emit Bond(
-            stakedRebasing(),
             unstakedRebasing(),
-            rebaseBonded,
+            stakedRebasing(),
+            warmupBalance(),
+            rebaseBonded(),
             address(bondDepository)
         );
     }
@@ -751,31 +846,38 @@ contract StrategySpartacus is StratManager, FeeManager {
     /**
      * @dev Claim redeem rewards from a bond and payout reserves if the bond is over.
      * @notice Stakes redeem rewards
+     * @notice Performs final redeem in the case of an empty BondInfo
      */
-    function _redeem() internal {
-        uint256 percentVested = IBondDepository(currentBond).percentVestedFor(
-            address(this)
-        );
-
-        uint256 rebaseAmountBefore = unstakedRebasing();
+    function _redeem(bool forceEnd) internal {
         IBondDepository(currentBond).redeem(address(this), false);
-        uint256 rebaseRedeemed = unstakedRebasing().sub(rebaseAmountBefore);
-        _stake();
-        rebaseRedeemed = _chargeFees(rebaseRedeemed);
-        if (rebaseBonded > rebaseRedeemed) rebaseBonded -= rebaseRedeemed;
-        else rebaseBonded = 0;
+        _stake(true);
 
         // If this is final redemption, remove currentBond and update claimOfReserves
-        if (percentVested >= 10000) {
+        if (
+            rebaseBonded() <= 0 ||
+            (forceEnd && reserves <= totalRebasing().add(warmupBalance()))
+        ) {
+            uint256 warmupExpiry = currentWarmupExpiry();
             currentBond = address(0);
-            rebaseBonded = 0;
+            reservePeriods[currentReservePeriod] = ReservePeriod({
+                fullyVested: true,
+                warmupExpiry: warmupExpiry
+            });
 
-            for (uint256 i = 0; i < reserveUsers.length; i++) {
-                claimOfReserves[reserveUsers[i]].fullyVested = true;
-            }
-            emit RedeemFinal(totalRebasing(), rebaseRedeemed);
-            delete reserveUsers;
-        } else emit Redeem(totalBalance(), rebaseRedeemed);
+            emit RedeemFinal(
+                unstakedRebasing(),
+                stakedRebasing(),
+                warmupBalance(),
+                totalBalance()
+            );
+        } else
+            emit Redeem(
+                unstakedRebasing(),
+                stakedRebasing(),
+                warmupBalance(),
+                rebaseBonded(),
+                totalBalance()
+            );
     }
 
     /**
@@ -784,8 +886,41 @@ contract StrategySpartacus is StratManager, FeeManager {
      */
     function _chargeFees(uint256 _amount) internal returns (uint256) {
         uint256 fee = _amount.mul(serviceFee).div(SERVICE_FEE_DIVISOR);
-        IERC20(stakedRebaseToken).safeTransfer(serviceFeeRecipient, fee);
+        IStakingManager(stakeManager).claim(serviceFeeRecipient);
+        IERC20(rebaseToken).safeIncreaseAllowance(stakeManager, fee);
+        IStakingManager(stakeManager).stake(fee, serviceFeeRecipient);
+
+        emit ChargeFees(fee);
+
         return _amount.sub(fee);
+    }
+
+    /**
+     * @dev Begin new ReservePeriod
+     * @param vested If false, new epoch includes bond vesting period
+     * @param warmupExpiry Warmup expiry for the new ReservePeriod
+     */
+    function _beginNewReservePeriod(bool vested, uint256 warmupExpiry)
+        internal
+    {
+        currentReservePeriod = currentReservePeriod.add(1);
+        reservePeriods[currentReservePeriod] = ReservePeriod({
+            fullyVested: vested,
+            warmupExpiry: warmupExpiry
+        });
+    }
+
+    /**
+     * @dev Set the strat's staking lock
+     * @param forceLock the lock state (false -> unlocked) to force
+     */
+    function _setStakeLock(bool forceLock) internal {
+        bool currentLock;
+        (, , , currentLock) = IStakingManager(stakeManager).warmupInfo(
+            address(this)
+        );
+        if ((forceLock && !currentLock) || (!forceLock && currentLock))
+            IStakingManager(stakeManager).toggleDepositLock();
     }
 
     /* ======== STRATEGY UPGRADE FUNCTIONS ======== */
@@ -799,8 +934,10 @@ contract StrategySpartacus is StratManager, FeeManager {
         require(msg.sender == vault, "!vault");
         require(reserves <= 0, "Reserves must be empty!");
         require(!isBonding(), "Cannot retire while bonding!");
+        require(warmedUp(), "Must be warmed up!");
 
         if (!paused()) _pause();
+        _claimStake(true);
         _unstake(stakedRebasing());
 
         IERC20(rebaseToken).safeTransfer(vault, unstakedRebasing());
@@ -813,7 +950,8 @@ contract StrategySpartacus is StratManager, FeeManager {
      */
     function panic() external onlyOwner {
         if (!paused()) _pause();
-        if (isBonding()) _redeem();
+        if (isBonding()) _redeem(false);
+        _claimStake(true);
         _unstake(stakedRebasing());
     }
 
@@ -835,11 +973,16 @@ contract StrategySpartacus is StratManager, FeeManager {
      * @dev Stakes all unstaked {rebaseToken} locked
      */
     function stake() external onlyOwner {
-        _stake();
+        if (reservePeriodFinished(currentReservePeriod))
+            _beginNewReservePeriod(true, newWarmupExpiry());
+        else
+            reservePeriods[currentReservePeriod]
+                .warmupExpiry = newWarmupExpiry();
+        _stake(true);
     }
 
     /**
-     * @dev Unstakes all unstaked {rebaseToken} locked
+     * @dev Unstakes all staked {rebaseToken} locked
      */
     function unstakeAll() external onlyOwner {
         _unstake(stakedRebasing());
@@ -851,6 +994,28 @@ contract StrategySpartacus is StratManager, FeeManager {
      */
     function unstake(uint256 _amount) external onlyOwner {
         _unstake(_amount);
+    }
+
+    /**
+     * @dev Claims any warmed up funds.
+     */
+    function claimStake() external onlyManager {
+        _claimStake(false);
+    }
+
+    /**
+     * @dev Toggle staking lock in case it gets out of sync
+     */
+    function toggleStakingLock() external onlyOwner {
+        IStakingManager(stakeManager).toggleDepositLock();
+    }
+
+    function redeemForBond(IBondDepository bondDepository) external onlyOwner {
+        bondDepository.redeem(address(this), false);
+    }
+
+    function forceFinalRedeem() external onlyOwner {
+        _redeem(true);
     }
 
     /**
@@ -867,7 +1032,74 @@ contract StrategySpartacus is StratManager, FeeManager {
     /* ======== UTILITY FUNCTIONS ======== */
 
     /**
-     * @dev Returns the max amount of SPA that can be bonded into the given bond
+     * @dev Whether or not the strategy's stake is warmed up
+     */
+    function warmedUp() public view returns (bool) {
+        return currentEpochNumber() >= currentWarmupExpiry();
+    }
+
+    /**
+     * @dev Returns true if staking during the current epoch will not extend the warmupExpiry
+     */
+    function safeToStake() public view returns (bool) {
+        uint256 warmupExpiry = currentWarmupExpiry();
+        return warmupExpiry == 0 || newWarmupExpiry() <= warmupExpiry;
+    }
+
+    /**
+     * @dev Computes the new warmupExpiry if the strategy were to stake this epoch
+     */
+    function newWarmupExpiry() public view returns (uint256) {
+        uint256 warmupPeriod = IStakingManager(stakeManager).warmupPeriod();
+        return currentEpochNumber().add(warmupPeriod);
+    }
+
+    /**
+     * @dev Whether or not a claimer's position is fully vested
+     */
+    function claimerVested(address _claimer) public view returns (bool) {
+        ReservePeriod memory userReservePeriod = reservePeriods[
+            claimOfReserves[_claimer].reservePeriod
+        ];
+        return
+            userReservePeriod.fullyVested &&
+            currentEpochNumber() >= userReservePeriod.warmupExpiry;
+    }
+
+    /**
+     * @dev Whether the supplied epoch is finished
+     * @param _epochNum The epoch to examine
+     */
+    function reservePeriodFinished(uint256 _epochNum)
+        public
+        view
+        returns (bool)
+    {
+        ReservePeriod memory reservePeriod = reservePeriods[_epochNum];
+        return
+            _epochNum == 0 ||
+            (reservePeriod.fullyVested &&
+                reservePeriod.warmupExpiry <= currentEpochNumber());
+    }
+
+    /**
+     * @dev The current warmupExpiry of this strat
+     */
+    function currentWarmupExpiry() public view returns (uint256 _warmupExpiry) {
+        (, , _warmupExpiry, ) = IStakingManager(stakeManager).warmupInfo(
+            address(this)
+        );
+    }
+
+    /**
+     * @dev The current epoch number from the stakeManager
+     */
+    function currentEpochNumber() public view returns (uint256 _epoch) {
+        (, _epoch, , ) = IStakingManager(stakeManager).epoch();
+    }
+
+    /**
+     * @dev Returns the max amount of FHM that can be bonded into the given bond
      * @param bondDepository BondDepository to calculate the max bond size for
      */
     function maxBondSize(IBondDepository bondDepository)
@@ -955,7 +1187,8 @@ contract StrategySpartacus is StratManager, FeeManager {
         returns (uint256)
     {
         (uint256 Res0, uint256 Res1, ) = rebaseTokenDaiPair.getReserves();
+
         // return # of Dai needed to buy _amount of rebaseToken
-        return _amount.mul(Res1).div(Res0);
+        return _amount.mul(Res0).div(Res1);
     }
 }
